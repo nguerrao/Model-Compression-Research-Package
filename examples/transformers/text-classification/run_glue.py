@@ -30,6 +30,8 @@ Changes made to the script:
  5. Added quantization capabilities
  6. Changed saving mechanism to save both matched and mismatched results for MNLI dataset
 """
+import sys
+sys.path.append("/home/nguerraoui/quantization/bert_quantization/Model-Compression-Research-Package")
 
 import logging
 import os
@@ -61,6 +63,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
+
 from model_compression_research import (
     add_pruning_arguments_to_parser,
     HFTrainerPruningCallback,
@@ -70,7 +73,8 @@ from model_compression_research import (
     hf_remove_teacher_from_student,
     get_linear_rewinding_schedule_with_warmup,
 )
-
+import copy
+from torch import nn
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.6.0")
@@ -101,8 +105,8 @@ class DataTrainingArguments:
     """
 
     task_name: Optional[str] = field(
-        default=None,
-        metadata={"help": "The name of the task to train on: " + ", ".join(task_to_keys.keys())},
+       default=None,
+       metadata={"help": "The name of the task to train on: " + ", ".join(task_to_keys.keys())},
     )
     max_seq_length: int = field(
         default=128,
@@ -386,7 +390,22 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+
     # Quantization
+    #function to add quand dequant layers
+    def adjust_model(model):
+        for child_name, child in model.named_children():
+            if isinstance(child, nn.Linear): 
+                setattr(model, child_name, nn.Sequential(
+                    torch.quantization.QuantStub(),
+                    child,
+                    torch.quantization.DeQuantStub()
+                ))
+            elif isinstance(child, nn.Embedding):
+                child.qconfig= torch.quantization.float_qparams_weight_only_qconfig
+            else:
+                adjust_model(child)
+
     model_class = AutoModelForSequenceClassification.from_config(
         config).__class__
     model_class = quantization_model_or_class_factory(compression_args, cls=model_class)
@@ -398,6 +417,11 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+   
+   
+    model_qat=copy.deepcopy(model)
+    adjust_model(model_qat)
+   
 
     # Preprocessing the datasets
     if data_args.task_name is not None:
@@ -561,10 +585,18 @@ def main():
          )
         # TODO Temp hack, need to find a way to use learning rate rewinding without overriding existing schedulers
         transformers.optimization.TYPE_TO_SCHEDULER_FUNCTION[transformers.SchedulerType('linear')] = lr_sched_fn
+    
+    #prepare to quantization 
+    model_qat.train()
+    model_qat.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+    torch.quantization.prepare_qat(model_qat, inplace=True)
+    model_qat.cuda()
+
+    # DO THE TRAINING 
 
     # Initialize our Trainer
     trainer = Trainer(
-        model=model,
+        model=model_qat,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
@@ -587,7 +619,13 @@ def main():
             data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
         )
         metrics["train_samples"] = min(max_train_samples, len(train_dataset))
-
+    
+    #convert the model  
+    model_qat.cpu()
+    model_qat.eval()
+    torch.quantization.convert(model_qat, inplace=True)
+    #print("the model qat is", model_qat)
+    '''
         if distill_args.distill:
             hf_remove_teacher_from_student(trainer.model)
             # There might have been a change in the forward signature of the model
@@ -602,21 +640,40 @@ def main():
             torch.save([vars(a) for a in [training_args, data_args, model_args, distill_args, compression_args]], os.path.join(training_args.output_dir, "args.bin"))
         except:
             logger.info("Failed to save arguments")
+    
+
+
+    model.cpu()
+    quantized_model = torch.quantization.quantize_dynamic(
+    model, {torch.nn.Linear}, dtype=torch.qint8
+    )
+    print(quantized_model)
+    '''
+    
+
 
     # Evaluation
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
+        print("cuda is", next(model_qat.parameters()).is_cuda)
 
         # Loop to handle MNLI double evaluation (matched, mis-matched)
         tasks = [data_args.task_name]
         eval_datasets = [eval_dataset]
+
+        device = "cpu"
+        #eval_datasets.to(device)
+        print("eval_datasets: ",eval_datasets)
+        print("eval_datasets[0]]",type(eval_datasets[0]))
+        print("eval_datasets[0][premise]",type(eval_datasets[0]["premise"]))
+    
+       
         if data_args.task_name == "mnli":
             tasks.append("mnli-mm")
             eval_datasets.append(datasets["validation_mismatched"])
 
         for eval_dataset, task in zip(eval_datasets, tasks):
             metrics = trainer.evaluate(eval_dataset=eval_dataset)
-
             max_eval_samples = (
                 data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
             )
@@ -626,7 +683,7 @@ def main():
             trainer.save_metrics("eval", metrics)
             if data_args.task_name == "mnli":
                 trainer.save_metrics(task, metrics)
-
+        
     if training_args.do_predict:
         logger.info("*** Predict ***")
 
@@ -664,6 +721,20 @@ def main():
             kwargs["dataset"] = f"GLUE {data_args.task_name.upper()}"
 
         trainer.push_to_hub(**kwargs)
+    
+    def print_size_of_model(model):
+        """ Print the size of the model.
+        
+        Args:
+            model: model whose size needs to be determined
+
+        """
+        torch.save(model.state_dict(), "temp.p")
+        print('Size of the model(MB):', os.path.getsize("temp.p")/1e6)
+        os.remove('temp.p')
+        
+    print_size_of_model(model)
+    print_size_of_model(model_qat)
 
 
 def _mp_fn(index):
